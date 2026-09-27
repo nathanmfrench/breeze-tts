@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import os
+import queue
 import tempfile
 import threading
 import uuid
@@ -16,6 +18,7 @@ from pathlib import Path
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.background import BackgroundTask
 
 from breeze_infer.runtime import (
     load_runtime,
@@ -53,6 +56,8 @@ class ApiSettings:
 
 _settings: ApiSettings | None = None
 _request_lock = threading.Lock()
+# The worker polls this often so a disconnected caller unblocks a queued chunk.
+_STREAM_POLL_SECONDS = 0.05
 
 
 def _pcm16(audio: np.ndarray) -> bytes:
@@ -176,6 +181,106 @@ def health() -> JSONResponse:
     return JSONResponse({"status": "ok", "sample_rate": app.state.runtime.sample_rate})
 
 
+class _SpeechLease:
+    """Owns the single-flight lock and the optional reference file.
+
+    The worker releases the lease when inference exits. A caller that goes
+    away only sets a stop event; awaiting that exit from the response
+    generator is not reliable, because an async generator's ``finally`` does
+    not finish an await when the client disconnects.
+    """
+
+    def __init__(self, reference_path: Path | None) -> None:
+        self.reference_path = reference_path
+        self.started = False
+        self._released = False
+        self._gate = threading.Lock()
+
+    def release(self) -> None:
+        with self._gate:
+            if self._released:
+                return
+            self._released = True
+        if self.reference_path is not None:
+            self.reference_path.unlink(missing_ok=True)
+            self.reference_path = None
+        _request_lock.release()
+
+    def release_if_unused(self) -> None:
+        if not self.started:
+            self.release()
+
+
+def _offer(
+    chunks: queue.Queue[bytes | Exception | None],
+    stop: threading.Event,
+    item: bytes | Exception | None,
+) -> bool:
+    while not stop.is_set():
+        try:
+            chunks.put(item, timeout=_STREAM_POLL_SECONDS)
+            return True
+        except queue.Full:
+            continue
+    return False
+
+
+def _take(chunks: queue.Queue[bytes | Exception | None]) -> bytes | Exception | None:
+    return chunks.get(timeout=_STREAM_POLL_SECONDS)
+
+
+async def _next_pcm(chunks: queue.Queue[bytes | Exception | None]) -> bytes | Exception | None:
+    while True:
+        try:
+            return await asyncio.to_thread(_take, chunks)
+        except queue.Empty:
+            continue
+
+
+async def _speech_pcm(
+    runtime: FastBreezeStreamingRuntime,
+    inputs: dict[str, object],
+    lease: _SpeechLease,
+    *,
+    request_id: str,
+    seed: int,
+) -> AsyncIterator[bytes]:
+    lease.started = True
+    stop = threading.Event()
+    chunks: queue.Queue[bytes | Exception | None] = queue.Queue(maxsize=1)
+
+    def worker() -> None:
+        try:
+            for chunk in _iter_seeded_audio_chunks(
+                runtime,
+                inputs,
+                request_id=request_id,
+                seed=seed,
+            ):
+                if stop.is_set():
+                    return
+                pcm = _pcm16(chunk.audio)
+                if pcm and not _offer(chunks, stop, pcm):
+                    return
+        except Exception as exc:
+            _offer(chunks, stop, exc)
+        finally:
+            lease.release()
+            _offer(chunks, stop, None)
+
+    threading.Thread(target=worker, name=f"breeze-{request_id}", daemon=True).start()
+    try:
+        while True:
+            item = await _next_pcm(chunks)
+            if item is None:
+                return
+            if isinstance(item, Exception):
+                raise item
+            yield item
+    finally:
+        stop.set()
+
+
 @app.post("/v1/audio/speech")
 async def speech(
     text: str = Form(...),
@@ -238,30 +343,22 @@ async def speech(
         _request_lock.release()
         raise
 
-    def body() -> Iterator[bytes]:
-        try:
-            for chunk in _iter_seeded_audio_chunks(
-                app.state.runtime,
-                inputs,
-                request_id=request_id,
-                seed=seed,
-            ):
-                pcm = _pcm16(chunk.audio)
-                if pcm:
-                    yield pcm
-        finally:
-            if reference_path is not None:
-                reference_path.unlink(missing_ok=True)
-            _request_lock.release()
-
+    lease = _SpeechLease(reference_path)
     return StreamingResponse(
-        body(),
+        _speech_pcm(
+            app.state.runtime,
+            inputs,
+            lease,
+            request_id=request_id,
+            seed=seed,
+        ),
         media_type="audio/pcm",
         headers={
             "X-Sample-Rate": str(app.state.runtime.sample_rate),
             "X-Sample-Format": "s16le",
             "Cache-Control": "no-store",
         },
+        background=BackgroundTask(lease.release_if_unused),
     )
 
 

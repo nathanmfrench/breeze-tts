@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
+import time
+from types import SimpleNamespace
 
 import numpy as np
 
 from breeze_infer.api import (
     DEFAULT_CFG_SCALE,
+    _SpeechLease,
     _iter_seeded_audio_chunks,
     _pcm16,
+    _request_lock,
+    _speech_pcm,
     app,
     speech,
 )
@@ -90,3 +96,50 @@ def test_streaming_reseeds_immediately_before_model_sampling(monkeypatch) -> Non
         ("seed", 43),
         ("sample", {"input_ids": "prepared"}, "request-1", 43, None),
     ]
+
+
+def _endless_runtime() -> object:
+    class Runtime:
+        def iter_audio_chunks(self, inputs, *, request_id, seed, token_observer):
+            del inputs, request_id, seed, token_observer
+            while True:
+                yield SimpleNamespace(audio=np.ones(2, dtype=np.float32))
+
+    return Runtime()
+
+
+def _wait_for_lock() -> None:
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        if _request_lock.acquire(blocking=False):
+            _request_lock.release()
+            return
+        time.sleep(0.02)
+    raise AssertionError("speech lock was still held after the caller disconnected")
+
+
+def test_disconnect_releases_the_speech_lock() -> None:
+    assert _request_lock.acquire(blocking=False)
+    lease = _SpeechLease(None)
+
+    async def scenario() -> None:
+        stream = _speech_pcm(
+            _endless_runtime(),
+            {},
+            lease,
+            request_id="request-1",
+            seed=1,
+        )
+        try:
+            chunk = await stream.__anext__()
+            assert chunk
+            async for _ in stream:
+                raise RuntimeError("caller hung up")
+        except RuntimeError:
+            pass
+
+    try:
+        asyncio.run(scenario())
+        _wait_for_lock()
+    finally:
+        lease.release()
